@@ -1,0 +1,39 @@
+﻿================================================================================
+🚀 MQL5/MQL4 PROJECT DUMP
+📅 Tạo lúc: 2025-07-08 22:21:14
+📂 Project: 02_Chiến Lược
+📍 Path: C:\Users\ADMIN\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Experts\Sonic R_MC\02_Chiến Lược
+================================================================================
+
+📁 CẤU TRÚC THƯ MỤC
+--------------------------------------------------
+└── 02_Chiến Lược
+    ├── APEX_PULLBACK_EA_v4_WhitePaper.md
+    ├── EA_SOURCE_DUMP_20250708_222114.txt
+    ├── SONIC R SYSTEM - TÀI LIỆU NGHIÊN CỨU TOÀN DIỆN.md
+    └── SONIC_R_ULTIMATE_RESEARCH_DOCUMENT.md
+
+📋 FILE HỖ TRỢ KHÁC
+==================================================
+
+📄 File: APEX_PULLBACK_EA_v4_WhitePaper.md
+----------------------------------------
+📄 File: EA_SOURCE_DUMP_20250708_222114.txt
+----------------------------------------
+
+
+----------------------------------------
+
+📄 File: SONIC R SYSTEM - TÀI LIỆU NGHIÊN CỨU TOÀN DIỆN.md
+----------------------------------------
+📄 File: SONIC_R_ULTIMATE_RESEARCH_DOCUMENT.md
+----------------------------------------
+📊 THỐNG KÊ TỔNG KẾT
+==================================================
+✅ File MQL đã xử lý: 0
+📄 File hỗ trợ: 4
+📝 Tổng dòng code: 15,347
+💾 Tổng ký tự: 682,912
+📁 Kích thước output: 0.0 KB
+
+🎉 HOÀN THÀNH! File dump đã sẵn sàng cho AI phân tích!

@@ -1,0 +1,1285 @@
+#property copyright "Copyright 2024, APEX EA DEVELOPMENT & Cáo Già AI"
+#property link      "https://www.your-project-link.com"
+#property version   "1.00"
+
+#property indicator_chart_window
+#property indicator_buffers 6 
+#property indicator_plots   2
+
+// Removed includes for deleted files
+// #include "Shared_DataStructures.mqh"
+// #include "UI_Dashboard_Manager.mqh" 
+// #include "Analysis_POIScoring.mqh" 
+
+//+------------------------------------------------------------------+
+//| ENUMS & STRUCTS (Previously in Shared_DataStructures.mqh)      |
+//+------------------------------------------------------------------+
+
+enum ENUM_SWING_TYPE
+{
+    SWING_LOW,  // A swing low point
+    SWING_HIGH  // A swing high point
+};
+
+enum ENUM_TREND
+{
+    TREND_NONE, // No defined trend
+    TREND_UP,   // Uptrend
+    TREND_DOWN  // Downtrend
+};
+
+enum ENUM_OB_FILTER_METHOD
+{
+    ATR_MULTIPLIER, // Filter by ATR multiplier
+    VOLUME_SPIKE    // Filter by volume spike (future implementation)
+};
+
+enum ENUM_MITIGATION_METHOD
+{
+    WICK,           // Mitigation by wick touching the OB
+    HIGH_LOW,       // Mitigation by price breaking the high/low of the OB
+    CLOSE           // Mitigation by candle close inside the OB (future implementation)
+};
+
+enum ENUM_TREND_COLOR_MODE
+{
+    TREND_COLOR_NONE,
+    TREND_COLOR_CANDLES,
+    TREND_COLOR_BACKGROUND
+};
+
+struct SwingPointExt
+{
+    int         bar_index;
+    double      price;
+    datetime    time;
+    ENUM_SWING_TYPE type;
+};
+
+struct Structure
+{
+    int         bar_index;
+    datetime    time;
+    double      price;       // Price of the swing point that caused the break
+    string      type;        // "BOS" or "CHoCH"
+    ENUM_TREND  trend;       // The trend *after* this structure formed
+    double      break_price; // The price level of the swing point that was broken
+    datetime    break_time;  // The time of the swing point that was broken
+    double      high_price;  // The highest price in the current structural leg
+    datetime    high_time;   // The time of the highest price
+    double      low_price;   // The lowest price in the current structural leg
+    datetime    low_time;    // The time of the lowest price
+    datetime    start_time;  // The start time of the current structural leg
+};
+
+struct OrderBlock
+{
+    int         bar_index;
+    double      high;
+    double      low;
+    datetime    time;
+    bool        is_bullish;
+    bool        is_mitigated;
+};
+
+struct FairValueGap
+{
+    int         bar_index;
+    double      high;
+    double      low;
+    datetime    time;
+    bool        is_bullish;
+    bool        is_filled; // Changed from is_mitigated for clarity
+};
+
+struct LiquidityLevel
+{
+    double      price;
+    datetime    start_time;
+    datetime    end_time;
+    string      type; // "EQH" or "EQL"
+};
+
+//+------------------------------------------------------------------+
+//| Array Utility Functions                                          |
+//+------------------------------------------------------------------+
+// Generic function to add an element to the end of an array
+template<typename T>
+void ArrayAdd(T &arr[], const T &element)
+{
+    int size = ArraySize(arr);
+    ArrayResize(arr, (uint)size + 1);
+    arr[size] = element;
+}
+
+// Generic function to insert an element at a specific position
+template<typename T>
+bool ArrayInsert(T &arr[], const T& element, uint pos)
+{
+    int size = ArraySize(arr);
+    if(pos > (uint)size) {
+        Print("Error: ArrayInsert position is out of range.");
+        return false;
+    }
+    if(ArrayResize(arr, size + 1) == -1) return false;
+
+    for(int i = size; i > (int)pos; i--)
+    {
+        arr[i] = arr[i-1];
+    }
+    arr[pos] = element;
+    return true;
+}
+
+// --- Dummy plot to satisfy compiler
+#property indicator_label1  ""
+#property indicator_type1   DRAW_NONE
+
+//--- plot Color Candles
+#property indicator_label2  "Trend Candles"
+#property indicator_type2   DRAW_COLOR_CANDLES
+#property indicator_color2  C'46,139,87', C'205,92,92', C'0,100,0', C'139,0,0' // Internal Bull, Internal Bear, Swing Bull, Swing Bear
+#property indicator_width2  1
+
+//+------------------------------------------------------------------+
+//| Defines, Enums, and Global Variables                             |
+//+------------------------------------------------------------------+
+
+// --- Drawing Constants
+#define FUTURE_BARS_TO_EXTEND 50
+#define ATR_PERIOD 14
+#define SECONDS_PER_MINUTE 60
+#define FVG_EXTENSION_MULTIPLIER 50
+#define DEFAULT_FONT_SIZE 10
+#define EQLH_MIN_POINTS 3
+
+
+
+//--- Input Parameters (Restructured)
+input group "--- Swing Structure Settings ---"
+input bool   InpShowSwingStructure = true;
+input int    InpSwingLookback   = 15;      // Lookback period for swing detection
+input color  InpSwingLineColor  = clrDodgerBlue; // Color for swing lines
+input ENUM_LINE_STYLE InpSwingLineStyle = STYLE_SOLID; // Style for swing lines
+input int    InpSwingLineWidth  = 2;         // Width for swing lines
+input bool   InpShowSwingLabels = true;     // Show Structure Labels (BOS/CHoCH)
+input bool   InpShowBOS         = true;      // Show Break of Structure (BOS)
+input bool   InpShowCHoCH       = true;      // Show Change of Character (CHoCH)
+input bool   InpShowStrongWeakHighLow = true; // Show Strong/Weak Highs & Lows
+
+input group "--- Internal Structure Settings ---"
+input bool   InpShowInternalStructure = true; // Show Internal Structure
+input int    InpInternalLookback  = 5;       // Lookback for internal structure
+input color  InpInternalLineColor = clrLightSalmon;
+input ENUM_LINE_STYLE InpInternalLineStyle = STYLE_DOT;
+input int    InpInternalLineWidth = 1;
+input ENUM_TREND_COLOR_MODE InpInternalTrendType = TREND_COLOR_NONE; // Color Trend
+input color InpInternalBullTrendColor = C'46,139,87,180'; // Trend Up Color
+input color InpInternalBearTrendColor = C'205,92,92,180'; // Trend Down Color
+
+input group "--- Major Structure Settings ---"
+input bool InpShowMajorStructure = true;
+input int InpMajorLookback = 50;
+input color InpMajorLineColor = clrOrange;
+input ENUM_LINE_STYLE InpMajorLineStyle = STYLE_SOLID;
+input int InpMajorLineWidth = 3;
+input ENUM_TREND_COLOR_MODE InpSwingTrendType = TREND_COLOR_NONE; // Color Trend
+input color InpSwingBullTrendColor = C'0,100,0,180'; // Trend Up Color
+input color InpSwingBearTrendColor = C'139,0,0,180'; // Trend Down Color
+
+input group "--- Order Block Settings ---"
+input bool   InpShowInternalOB  = true;
+input int    InpMaxInternalOB   = 5;
+input int    InpInternalOBBorderWidth = 1;
+input color  InpIntBullishOBColor = (color)0x33228B22;  // Internal Bullish OB Color
+input color  InpIntBearishOBColor = (color)0x33B22222;  // Internal Bearish OB Color
+
+input bool   InpShowSwingOB     = true;
+input int    InpMaxSwingOB      = 5;
+input int    InpSwingOBBorderWidth = 2;
+input color  InpSwingBullishOBColor = (color)0x4D006400;  // Swing Bullish OB Color
+input color  InpSwingBearishOBColor = (color)0x4D8B0000;  // Swing Bearish OB Color
+
+input ENUM_OB_FILTER_METHOD InpObFilterMethod = ATR_MULTIPLIER; // OB Filter Method
+input double InpObAtrMultiplier = 1.0;      // ATR Multiplier for OB validation
+input bool   InpObFilterBySize = true;      // Filter OBs by size relative to ATR
+input double InpObMinAtrSize = 0.5;         // Min OB size as a multiple of ATR
+input double InpObMaxAtrSize = 3.0;         // Max OB size as a multiple of ATR
+input ENUM_MITIGATION_METHOD InpObMitigationMethod = HIGH_LOW; // OB Mitigation Method
+input color  InpScoreTextColor  = clrWhite;          // Color for POI Score text
+
+input group "--- Premium/Discount Zones ---"
+input bool   InpShowPDZones      = true;
+input color  InpPremiumColor     = (color)0x1AFF0000; // Red with ~10% alpha
+input color  InpDiscountColor    = (color)0x1A008000; // Green with ~10% alpha
+input color  InpEquilibriumColor = clrGray;
+
+input group "--- Fair Value Gaps (FVG) ---"
+input bool   InpShowFVG         = true;
+input ENUM_TIMEFRAMES InpFVGTimeframe = PERIOD_CURRENT; // FVG Timeframe
+input bool   InpFVGAutoThreshold = true;              // Use Auto Threshold for FVG
+input double InpFVGATRMultiplier = 0.5;               // ATR Multiplier for FVG Threshold
+input color  InpBullishFVGColor = (color)0x26008000;    // Bullish FVG Color (Green with ~15% alpha)
+input color  InpBearishFVGColor = (color)0x26FF0000;    // Bearish FVG Color (Red with ~15% alpha)
+
+input group "--- Liquidity (EQH/EQL) ---"
+input bool   InpShowEQLH        = true;
+input double InpEQLHThreshold   = 0.2; // Threshold in ATR multiples for detection
+input color  InpEQLHColor       = clrGold;
+
+input group "--- MTF High/Low Levels ---"
+input bool   InpShowDailyLevels  = true;
+input color  InpDailyLevelColor  = clrSlateGray;
+input bool   InpShowWeeklyLevels = true;
+input color  InpWeeklyLevelColor = clrDarkTurquoise;
+input bool   InpShowMonthlyLevels= true;
+input color  InpMonthlyLevelColor= clrViolet;
+
+input group "--- Alerts ---"
+input bool   InpAlertOnBOS = true;
+input bool   InpAlertOnCHoCH = true;
+input bool   InpAlertOnFVG = true;
+input bool   InpAlertOnOBMitigation = false;
+input bool   InpAlertOnEQLH = true;
+
+// --- Global Variables & Arrays
+// We will use dynamic arrays to store our detected patterns
+SwingPointExt ExtMajorSwingPoints[];
+SwingPointExt ExtPrimarySwingPoints[];
+SwingPointExt ExtSubSwingPoints[];
+
+Structure  ExtMajorStructures[];
+Structure  ExtPrimaryStructures[];
+Structure  ExtSubStructures[];
+
+OrderBlock ExtInternalOrderBlocks[];
+OrderBlock ExtSwingOrderBlocks[];
+FairValueGap ExtFairValueGaps[];
+LiquidityLevel ExtLiquidityLevels[];
+
+// ATR Handle
+int ExtAtrHandle;
+
+// Object Management
+string     G_OBJECT_PREFIX = "SMC_";
+color      G_DefaultBgColor;
+
+// --- Indicator Buffers
+// We don't use traditional buffers for plotting, but we might need them for data export or EA communication later.
+double ExtDummyBuffer[];
+double OpenBuffer[];
+double HighBuffer[];
+double LowBuffer[];
+double CloseBuffer[];
+double ColorBuffer[];
+
+ENUM_TREND ExtInternalTrendByBar[];
+ENUM_TREND ExtSwingTrendByBar[];
+
+//+------------------------------------------------------------------+
+//| Swing Point & Structure Analysis Functions                       |
+//+------------------------------------------------------------------+
+// Advanced swing point identification with Inducement (IDM) logic
+void FindSwingPoints(const MqlRates &rates[], const int rates_total, const int lookback, SwingPointExt &points[])
+{
+    ArrayFree(points);
+
+    // Using a more robust ZigZag-style logic by finding peaks and troughs across a lookback window.
+    for (int i = 0; i < rates_total; i++)
+    {
+        // Check for Swing High
+        int high_lookback = MathMin(i, lookback);
+        int high_fwdlook = MathMin(rates_total - 1 - i, lookback);
+        double current_high = rates[i].high;
+        bool is_swing_high = true;
+        for (int j = 1; j <= high_lookback; j++) if (rates[i-j].high > current_high) { is_swing_high = false; break; }
+        if (!is_swing_high) continue;
+        for (int j = 1; j <= high_fwdlook; j++) if (rates[i+j].high > current_high) { is_swing_high = false; break; }
+        
+        if (is_swing_high)
+        {
+            // It's a swing high. Ensure it's not consecutive with another high.
+            if (ArraySize(points) > 0 && points[ArraySize(points)-1].type == SWING_HIGH)
+            {
+                // If the new high is higher, replace the last one.
+                if (current_high > points[ArraySize(points)-1].price)
+                {
+                    SwingPointExt sp_high = {i, current_high, rates[i].time, SWING_HIGH};
+                    points[ArraySize(points)-1] = sp_high;
+                }
+            }
+            else
+            {
+                SwingPointExt sp = {i, current_high, rates[i].time, SWING_HIGH};
+                ArrayAdd(points, sp);
+            }
+            continue; // Move to next bar, can't be both high and low
+        }
+        
+        // Check for Swing Low
+        int low_lookback = MathMin(i, lookback);
+        int low_fwdlook = MathMin(rates_total - 1 - i, lookback);
+        double current_low = rates[i].low;
+        bool is_swing_low = true;
+        for (int j = 1; j <= low_lookback; j++) if (rates[i-j].low < current_low) { is_swing_low = false; break; }
+        if (!is_swing_low) continue;
+        for (int j = 1; j <= low_fwdlook; j++) if (rates[i+j].low < current_low) { is_swing_low = false; break; }
+
+        if (is_swing_low)
+        {
+             // It's a swing low. Ensure it's not consecutive with another low.
+            if (ArraySize(points) > 0 && points[ArraySize(points)-1].type == SWING_LOW)
+            {
+                // If the new low is lower, replace the last one.
+                if (current_low < points[ArraySize(points)-1].price)
+                {
+                    SwingPointExt sp_low = {i, current_low, rates[i].time, SWING_LOW};
+                    points[ArraySize(points)-1] = sp_low;
+                }
+            }
+            else
+            {
+                 SwingPointExt sp = {i, current_low, rates[i].time, SWING_LOW};
+                 ArrayAdd(points, sp);
+            }
+        }
+    }
+}
+
+// Refactored structure detection logic for clarity and correctness
+void FindStructure(const MqlRates &rates[], const int rates_total, const SwingPointExt &swing_points[], Structure &structure_points[], OrderBlock &order_blocks[])
+{
+    ArrayFree(structure_points);
+    ArrayFree(order_blocks); // Clear order blocks as they are tied to structure
+    int points_count = ArraySize(swing_points);
+    if(points_count < 2) return;
+
+    ENUM_TREND current_trend = TREND_NONE;
+    SwingPointExt last_confirmed_high = {0};
+    SwingPointExt last_confirmed_low = {0};
+    
+    // Initialize first two points to establish initial trend
+    if(swing_points[0].type == SWING_HIGH)
+    {
+        last_confirmed_high = swing_points[0];
+        if (points_count > 1 && swing_points[1].type == SWING_LOW)
+        {
+           last_confirmed_low = swing_points[1];
+           current_trend = (last_confirmed_high.price > last_confirmed_low.price) ? TREND_DOWN : TREND_UP;
+        }
+    }
+    else // First point is SWING_LOW
+    {
+       last_confirmed_low = swing_points[0];
+       if (points_count > 1 && swing_points[1].type == SWING_HIGH)
+       {
+           last_confirmed_high = swing_points[1];
+           current_trend = (last_confirmed_high.price > last_confirmed_low.price) ? TREND_DOWN : TREND_UP;
+       }
+    }
+
+
+    for (int i = 2; i < points_count; i++)
+    {
+        SwingPointExt current_sp = swing_points[i];
+        string break_type = "";
+        SwingPointExt broken_sp;
+
+        if (current_sp.type == SWING_HIGH)
+        {
+            if (current_trend == TREND_UP && current_sp.price > last_confirmed_high.price)
+            {
+                break_type = "BOS";
+                broken_sp = last_confirmed_high;
+                last_confirmed_high = current_sp;
+            }
+            else if(current_trend == TREND_DOWN && current_sp.price > last_confirmed_high.price)
+            {
+                break_type = "CHoCH";
+                broken_sp = last_confirmed_high;
+                last_confirmed_high = current_sp;
+                current_trend = TREND_UP;
+            }
+        }
+        else // current_sp.type == SWING_LOW
+        {
+            if (current_trend == TREND_DOWN && current_sp.price < last_confirmed_low.price)
+            {
+                break_type = "BOS";
+                broken_sp = last_confirmed_low;
+                last_confirmed_low = current_sp;
+            }
+             else if(current_trend == TREND_UP && current_sp.price < last_confirmed_low.price)
+            {
+                break_type = "CHoCH";
+                broken_sp = last_confirmed_low;
+                last_confirmed_low = current_sp;
+                current_trend = TREND_DOWN;
+            }
+        }
+
+        if (break_type != "")
+        {
+            Structure s;
+            s.bar_index = broken_sp.bar_index; // The break happens *at* the broken point's bar
+            s.time = broken_sp.time;
+            s.price = current_sp.price;
+            s.break_price = broken_sp.price;
+            s.break_time = broken_sp.time;
+            s.type = break_type;
+            s.trend = current_trend;
+            s.high_price = last_confirmed_high.price;
+            s.high_time = last_confirmed_high.time;
+            s.low_price = last_confirmed_low.price;
+            s.low_time = last_confirmed_low.time;
+            s.start_time = (current_trend == TREND_UP) ? last_confirmed_low.time : last_confirmed_high.time;
+            ArrayAdd(structure_points, s);
+            
+            if ((break_type == "BOS" && InpAlertOnBOS) || (break_type == "CHoCH" && InpAlertOnCHoCH))
+            {
+                if(s.bar_index >= rates_total - 2) // Alert on last closed bar
+                {
+                     string trend_str = (s.trend == TREND_UP) ? "Bullish" : "Bearish";
+                     string structure_prefix = (ArraySize(structure_points) > ArraySize(ExtMajorStructures)) ? "Swing " : "Internal ";
+                     Alert(Symbol(), " ", Period(), ": New ", structure_prefix, trend_str, " ", s.type);
+                }
+            }
+            
+            // --- Find Order Block in the leg that led to the break ---
+            int start_scan_idx = 0;
+            int end_scan_idx = broken_sp.bar_index;
+            if(break_type == "BOS" && current_trend == TREND_UP) start_scan_idx = last_confirmed_low.bar_index;
+            else if(break_type == "CHoCH" && current_trend == TREND_UP) start_scan_idx = last_confirmed_low.bar_index;
+            else if(break_type == "BOS" && current_trend == TREND_DOWN) start_scan_idx = last_confirmed_high.bar_index;
+            else if(break_type == "CHoCH" && current_trend == TREND_DOWN) start_scan_idx = last_confirmed_high.bar_index;
+            
+            int ob_candle_idx = -1;
+            if(current_trend == TREND_UP) // Look for the last down candle before the up move
+            {
+                 for(int k = end_scan_idx -1; k > start_scan_idx; k--) {
+                    if (rates[k].close < rates[k].open) { ob_candle_idx = k; break; }
+                 }
+            }
+            else // Look for the last up candle before the down move
+            {
+                for(int k = end_scan_idx -1; k > start_scan_idx; k--) {
+                    if (rates[k].close > rates[k].open) { ob_candle_idx = k; break; }
+                }
+            }
+
+            if(ob_candle_idx != -1)
+            {
+                 OrderBlock ob;
+                 ob.bar_index = ob_candle_idx;
+                 ob.high = rates[ob_candle_idx].high;
+                 ob.low = rates[ob_candle_idx].low;
+                 ob.time = rates[ob_candle_idx].time;
+                 ob.is_bullish = (current_trend == TREND_UP);
+                 ob.is_mitigated = false;
+                 ArrayAdd(order_blocks, ob);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| POI (Point of Interest) Analysis Functions                     |
+//+------------------------------------------------------------------+
+// Refined Order Block detection logic
+void FindOrderBlocks(const MqlRates &rates[], const int rates_total, OrderBlock &order_blocks[])
+{
+    ArrayFree(order_blocks);
+    if (ExtAtrHandle == INVALID_HANDLE && InpObFilterBySize) {
+        Print("ATR handle is invalid for OB filtering.");
+        return;
+    }
+    double atr_values[];
+    if(InpObFilterBySize && CopyBuffer(ExtAtrHandle, 0, 0, rates_total, atr_values) <= 0) {
+        Print("Error copying ATR buffer for OB filtering.");
+        return;
+    }
+
+    // Loop from newest to oldest to prioritize recent OBs
+    for(int i = rates_total - 2; i > 0; i--)
+    {
+        // Bullish OB: Last down candle before a strong up move.
+        bool is_bullish_candle_pattern = rates[i].close < rates[i+1].close && rates[i+1].close > rates[i].high;
+        if(is_bullish_candle_pattern)
+        {
+            double ob_size = rates[i].high - rates[i].low;
+            if(!InpObFilterBySize || (ob_size >= atr_values[i] * InpObMinAtrSize && ob_size <= atr_values[i] * InpObMaxAtrSize))
+            {
+                OrderBlock ob;
+                ob.bar_index = i;
+                ob.high = rates[i].high;
+                ob.low = rates[i].low;
+                ob.time = rates[i].time;
+                ob.is_bullish = true;
+                ob.is_mitigated = false;
+                ArrayAdd(order_blocks, ob);
+            }
+        }
+
+        // Bearish OB: Last up candle before a strong down move.
+        bool is_bearish_candle_pattern = rates[i].close > rates[i+1].close && rates[i+1].close < rates[i].low;
+        if(is_bearish_candle_pattern)
+        {
+            double ob_size = rates[i].high - rates[i].low;
+            if(!InpObFilterBySize || (ob_size >= atr_values[i] * InpObMinAtrSize && ob_size <= atr_values[i] * InpObMaxAtrSize))
+            {
+                OrderBlock ob;
+                ob.bar_index = i;
+                ob.high = rates[i].high;
+                ob.low = rates[i].low;
+                ob.time = rates[i].time;
+                ob.is_bullish = false;
+                ob.is_mitigated = false;
+                ArrayAdd(order_blocks, ob);
+            }
+        }
+    }
+    // Since we added from newest to oldest, reverse the array to have oldest first for correct processing
+    ArrayReverse(order_blocks);
+}
+
+// Refined FVG detection logic
+void FindFairValueGaps(const MqlRates &rates[], const int rates_total, FairValueGap &fvgs[])
+{
+    ArrayFree(fvgs);
+
+    // --- Branch 1: Use current chart timeframe with ATR filter ---
+    if (InpFVGTimeframe == PERIOD_CURRENT || InpFVGTimeframe == 0)
+    {
+        if (ExtAtrHandle == INVALID_HANDLE && InpFVGAutoThreshold) {
+            Print("ATR handle is invalid for FVG filtering.");
+            return;
+        }
+        double atr_values[];
+        if(InpFVGAutoThreshold && CopyBuffer(ExtAtrHandle, 0, 0, rates_total, atr_values) <= 0) {
+            Print("Error copying ATR buffer for FVG filtering.");
+            return;
+        }
+
+        for(int i = 1; i < rates_total - 1; i++)
+        {
+            // Bullish FVG
+            bool is_bullish_fvg = rates[i-1].high < rates[i+1].low;
+            if(is_bullish_fvg)
+            {
+                double fvg_size = rates[i+1].low - rates[i-1].high;
+                if(!InpFVGAutoThreshold || fvg_size >= atr_values[i] * InpFVGATRMultiplier)
+                {
+                    FairValueGap fvg = {i, rates[i+1].low, rates[i-1].high, rates[i].time, true, false};
+                    ArrayAdd(fvgs, fvg);
+                    if(InpAlertOnFVG && fvg.bar_index == rates_total - 2)
+                    {
+                        Alert(Symbol(), " ", Period(), ": New Bullish FVG detected.");
+                    }
+                }
+            }
+
+            // Bearish FVG
+            bool is_bearish_fvg = rates[i-1].low > rates[i+1].high;
+            if(is_bearish_fvg)
+            {
+                double fvg_size = rates[i-1].low - rates[i+1].high;
+                if(!InpFVGAutoThreshold || fvg_size >= atr_values[i] * InpFVGATRMultiplier)
+                {
+                    FairValueGap fvg = {i, rates[i-1].low, rates[i+1].high, rates[i].time, false, false};
+                    ArrayAdd(fvgs, fvg);
+                    if(InpAlertOnFVG && fvg.bar_index == rates_total - 2)
+                    {
+                        Alert(Symbol(), " ", Period(), ": New Bearish FVG detected.");
+                    }
+                }
+            }
+        }
+    }
+    // --- Branch 2: Use MTF logic with PineScript-style auto threshold ---
+    else 
+    {
+        MqlRates htf_rates[];
+        int htf_bars_to_copy = rates_total;
+        if(PeriodSeconds(InpFVGTimeframe) > PeriodSeconds(_Period))
+        {
+           htf_bars_to_copy = (int)((double)rates_total * PeriodSeconds(_Period) / PeriodSeconds(InpFVGTimeframe)) + 5;
+        }
+
+        if(CopyRates(_Symbol, InpFVGTimeframe, 0, htf_bars_to_copy, htf_rates) <= 0)
+        {
+            Print("Error copying MTF rates history for FVG detection!");
+            return;
+        }
+
+        int htf_rates_total = ArraySize(htf_rates);
+        if(htf_rates_total < 3) return;
+        
+        ArrayReverse(htf_rates); // Reverse to loop from old to new for cumulative calculation
+
+        double cumulative_delta_sum = 0;
+
+        for(int i = 1; i < htf_rates_total - 1; i++)
+        {
+            // Auto Threshold Logic from Pine Script
+            bool passes_threshold = true;
+            if(InpFVGAutoThreshold)
+            {
+                double bar_delta_percent = 0;
+                if(htf_rates[i].open != 0)
+                   bar_delta_percent = MathAbs((htf_rates[i].close - htf_rates[i].open) / htf_rates[i].open);
+                
+                cumulative_delta_sum += bar_delta_percent;
+                double threshold = (i > 0) ? (cumulative_delta_sum / i) * 2.0 : 0;
+                passes_threshold = (bar_delta_percent > threshold);
+            }
+            
+            // Bullish FVG
+            bool is_bullish_fvg = htf_rates[i-1].high < htf_rates[i+1].low;
+            if(is_bullish_fvg && passes_threshold)
+            {
+                FairValueGap fvg;
+                fvg.bar_index = iBarShift(_Symbol, _Period, htf_rates[i].time);
+                fvg.high = htf_rates[i+1].low;
+                fvg.low = htf_rates[i-1].high;
+                fvg.time = htf_rates[i].time;
+                fvg.is_bullish = true;
+                fvg.is_filled = false;
+                ArrayAdd(fvgs, fvg);
+                if(InpAlertOnFVG && fvg.bar_index == rates_total - 2)
+                {
+                    Alert(Symbol(), " ", Period(), ": New Bullish MTF FVG detected on ", EnumToString(InpFVGTimeframe));
+                }
+            }
+
+            // Bearish FVG
+            bool is_bearish_fvg = htf_rates[i-1].low > htf_rates[i+1].high;
+            if(is_bearish_fvg && passes_threshold)
+            {
+                FairValueGap fvg;
+                fvg.bar_index = iBarShift(_Symbol, _Period, htf_rates[i].time);
+                fvg.high = htf_rates[i-1].low;
+                fvg.low = htf_rates[i+1].high;
+                fvg.time = htf_rates[i].time;
+                fvg.is_bullish = false;
+                fvg.is_filled = false;
+                ArrayAdd(fvgs, fvg);
+                if(InpAlertOnFVG && fvg.bar_index == rates_total - 2)
+                {
+                    Alert(Symbol(), " ", Period(), ": New Bearish MTF FVG detected on ", EnumToString(InpFVGTimeframe));
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Mitigation & Drawing Functions                                   |
+//+------------------------------------------------------------------+
+void UpdateMitigation(const MqlRates &rates[], OrderBlock &order_blocks[])
+{
+    int rates_total = ArraySize(rates);
+    for(int i = 0; i < ArraySize(order_blocks); i++)
+    {
+        if(order_blocks[i].is_mitigated) continue;
+
+        for(int k = order_blocks[i].bar_index + 1; k < rates_total; k++)
+        {
+            bool mitigated = false;
+            switch(InpObMitigationMethod)
+            {
+                case HIGH_LOW:
+                    if(order_blocks[i].is_bullish && rates[k].low < order_blocks[i].low) mitigated = true;
+                    else if(!order_blocks[i].is_bullish && rates[k].high > order_blocks[i].high) mitigated = true;
+                    break;
+                case WICK:
+                    if(order_blocks[i].is_bullish && rates[k].low <= order_blocks[i].high) mitigated = true;
+                    else if(!order_blocks[i].is_bullish && rates[k].high >= order_blocks[i].low) mitigated = true;
+                    break;
+                case CLOSE:
+                     if(order_blocks[i].is_bullish && rates[k].close < order_blocks[i].low) mitigated = true;
+                    else if(!order_blocks[i].is_bullish && rates[k].close > order_blocks[i].high) mitigated = true;
+                    break;
+            }
+
+            if(mitigated)
+            {
+                order_blocks[i].is_mitigated = true;
+                if(InpAlertOnOBMitigation && k == rates_total - 2)
+                {
+                    string ob_type = order_blocks[i].is_bullish ? "Bullish" : "Bearish";
+                    Alert(Symbol(), " ", Period(), ": ", ob_type, " Order Block at ", TimeToString(order_blocks[i].time), " was mitigated.");
+                }
+                break;
+            }
+        }
+    }
+}
+
+void UpdateFVGMitigation(const MqlRates &rates[], FairValueGap &fvgs[])
+{
+    for(int i = 0; i < ArraySize(fvgs); i++)
+    {
+        if(fvgs[i].is_filled) continue;
+
+        for(int k = fvgs[i].bar_index + 1; k < ArraySize(rates); k++)
+        {
+            if(fvgs[i].is_bullish && rates[k].low <= fvgs[i].high)
+            {
+                fvgs[i].is_filled = true;
+                break;
+            }
+            else if(!fvgs[i].is_bullish && rates[k].high >= fvgs[i].low)
+            {
+                fvgs[i].is_filled = true;
+                break;
+            }
+        }
+    }
+}
+
+void DrawSwingStructure(const SwingPointExt &swing_points[], const Structure &structure_points[], color line_color, int line_width, ENUM_LINE_STYLE line_style, const string type_prefix)
+{
+    string prefix = G_OBJECT_PREFIX + type_prefix;
+    // Draw ZigZag lines
+    for(int i = 1; i < ArraySize(swing_points); i++)
+    {
+        string name = prefix + "_Line_" + TimeToString(swing_points[i].time);
+        ObjectCreate(0, name, OBJ_TREND, 0, swing_points[i-1].time, swing_points[i-1].price, swing_points[i].time, swing_points[i].price);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, line_color);
+        ObjectSetInteger(0, name, OBJPROP_STYLE, line_style);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, line_width);
+        ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+    }
+
+    // Draw BOS/CHoCH labels and lines
+    if(InpShowBOS || InpShowCHoCH)
+    {
+        for(int i = 0; i < ArraySize(structure_points); i++)
+        {
+            const Structure s = structure_points[i];
+            if((s.type == "BOS" && !InpShowBOS) || (s.type == "CHoCH" && !InpShowCHoCH)) continue;
+
+            string line_name = prefix + "_StructureLine_" + TimeToString(s.time);
+            string text_name = prefix + "_StructureLabel_" + TimeToString(s.time);
+            
+            color structure_color = (s.type == "BOS") ? clrMediumSeaGreen : clrIndianRed;
+            if(s.trend == TREND_DOWN) structure_color = (s.type == "BOS") ? clrFireBrick : clrDeepSkyBlue;
+
+            // Draw dashed line across the broken level
+            ObjectCreate(0, line_name, OBJ_TREND, 0, s.break_time, s.break_price, s.time, s.break_price);
+            ObjectSetInteger(0, line_name, OBJPROP_COLOR, structure_color);
+            ObjectSetInteger(0, line_name, OBJPROP_STYLE, STYLE_DASHDOTDOT);
+            ObjectSetInteger(0, line_name, OBJPROP_WIDTH, 1);
+            ObjectSetInteger(0, line_name, OBJPROP_RAY_RIGHT, true);
+
+            // Draw Text Label
+            ObjectCreate(0, text_name, OBJ_TEXT, 0, s.time, s.price);
+            ObjectSetString(0, text_name, OBJPROP_TEXT, s.type + (s.trend == TREND_UP ? " bullish" : " bearish"));
+            ObjectSetInteger(0, text_name, OBJPROP_COLOR, structure_color);
+            ObjectSetInteger(0, text_name, OBJPROP_FONTSIZE, DEFAULT_FONT_SIZE -1);
+            ObjectSetInteger(0, text_name, OBJPROP_ANCHOR, s.trend == TREND_UP ? ANCHOR_TOP : ANCHOR_BOTTOM);
+            ObjectSetDouble(0, text_name, OBJPROP_ANGLE, 0);
+        }
+    }
+}
+
+void CleanupObjects(const string obj_prefix)
+{
+    for(int i = ObjectsTotal(0, -1, -1) - 1; i >= 0; i--)
+    {
+        string name = ObjectName(0, i, -1, -1);
+        if(StringFind(name, obj_prefix) == 0)
+        {
+            ObjectDelete(0, name);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+    // --- Basic checks and initialization ---
+    int min_bars = MathMax(InpSwingLookback, MathMax(InpInternalLookback, InpMajorLookback)) * 2;
+    if(rates_total < min_bars)
+    {
+        return 0;
+    }
+
+    // --- Full recalculation on new bar or first run ---
+    if(rates_total != prev_calculated || prev_calculated == 0)
+    {
+        MqlRates rates[];
+        if(CopyRates(_Symbol, _Period, 0, rates_total, rates) == -1)
+        {
+            Print("Error copying rates history!");
+            return 0;
+        }
+
+        // Cleanup old objects before redrawing
+        CleanupObjects(G_OBJECT_PREFIX);
+
+        // --- Analysis & Drawing ---
+        AnalyzeAllStructures(rates, rates_total);
+        AnalyzeAndDrawPOIs(rates, rates_total);
+        DrawAllPDZones();
+        DrawMTFLevels();
+        HandleTrendColoring(rates_total, open, high, low, close);
+    }
+
+    return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Draw Equal Highs/Lows on the chart                               |
+//+------------------------------------------------------------------+
+void DrawEqualHighsLows(const SwingPointExt &points[], const string obj_prefix)
+{
+    if(!InpShowEQLH || ExtAtrHandle == INVALID_HANDLE) return;
+
+    double atr_buffer[1];
+    if(CopyBuffer(ExtAtrHandle, 0, 0, 1, atr_buffer) <= 0) return;
+    double atr_value = atr_buffer[0];
+
+    int points_total = ArraySize(points);
+    if(points_total < 3) return;
+
+    for(int i = 2; i < points_total; i++)
+    {
+        // Check for two consecutive highs or lows
+        if(points[i].type == points[i-2].type)
+        {
+            double price_diff = MathAbs(points[i].price - points[i-2].price);
+            if(price_diff <= InpEQLHThreshold * atr_value)
+            {
+                string name = obj_prefix + "EQLH_" + (string)i;
+                string text = points[i].type == SWING_HIGH ? "EQH" : "EQL";
+                double price_level = MathMax(points[i].price, points[i-2].price);
+                datetime time1 = points[i-2].time;
+                datetime time2 = points[i].time;
+
+                ObjectCreate(0, name, OBJ_TREND, 0, time1, price_level, time2, price_level);
+                ObjectSetInteger(0, name, OBJPROP_COLOR, InpEQLHColor);
+                ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+
+                string label_name = name + "_label";
+                ObjectCreate(0, label_name, OBJ_TEXT, 0, time2, price_level);
+                ObjectSetString(0, label_name, OBJPROP_TEXT, " " + text);
+                ObjectSetInteger(0, label_name, OBJPROP_COLOR, InpEQLHColor);
+                ObjectSetInteger(0, label_name, OBJPROP_ANCHOR, (points[i].type == SWING_HIGH) ? ANCHOR_BOTTOM : ANCHOR_TOP);
+            }
+        }
+    }
+}
+
+void DrawOrderBlocks(const OrderBlock &order_blocks[], int max_to_show, color bull_color, color bear_color, int border_width, const string type_prefix)
+{
+    int orderBlocksSize = ArraySize(order_blocks);
+    if (orderBlocksSize == 0 || max_to_show <= 0) return;
+
+    int drawn_count = 0;
+    // Loop backwards to draw the most recent OBs first
+    for (int i = orderBlocksSize - 1; i >= 0; i--)
+    {
+        if (drawn_count >= max_to_show) break;
+
+        OrderBlock ob = order_blocks[i];
+        if(ob.is_mitigated) continue;
+
+        string obj_name = G_OBJECT_PREFIX + type_prefix + TimeToString(ob.time);
+        
+        datetime end_time = TimeCurrent() + PeriodSeconds() * FUTURE_BARS_TO_EXTEND;
+
+        if(!ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0, ob.time, ob.high, end_time, ob.low))
+        {
+            //ObjectCreate failed
+        }
+        
+        color ob_color = ob.is_bullish ? bull_color : bear_color;
+        ObjectSetInteger(0, obj_name, OBJPROP_COLOR, ob_color);
+        ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_SOLID);
+        ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+        ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, border_width);
+        
+        drawn_count++;
+    }
+}
+
+void DrawFairValueGaps(const FairValueGap &fvgs[])
+{
+    for (int i = 0; i < ArraySize(fvgs); i++)
+    {
+        FairValueGap fvg = fvgs[i];
+        if(fvg.is_filled) continue;
+        
+        string obj_name = G_OBJECT_PREFIX + "FVG_" + TimeToString(fvg.time);
+        
+        datetime end_time = TimeCurrent() + PeriodSeconds() * FVG_EXTENSION_MULTIPLIER;
+        
+        if(!ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0, fvg.time, fvg.high, end_time, fvg.low))
+        {
+             //ObjectCreate failed
+        }
+        
+        color fvg_color = fvg.is_bullish ? InpBullishFVGColor : InpBearishFVGColor;
+        ObjectSetInteger(0, obj_name, OBJPROP_COLOR, fvg_color);
+        ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_SOLID);
+        ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Premium/Discount Zones                                      |
+//+------------------------------------------------------------------+
+void DrawPremiumDiscountZone(const Structure &structure_leg, const string obj_prefix)
+{
+    if(!InpShowPDZones) return;
+
+    double highest_high = structure_leg.high_price;
+    double lowest_low = structure_leg.low_price;
+    datetime range_start_time = structure_leg.start_time;
+    datetime end_time = TimeCurrent() + PeriodSeconds() * FUTURE_BARS_TO_EXTEND;
+
+    if(highest_high <= lowest_low) return;
+
+    double equilibrium = (highest_high + lowest_low) / 2.0;
+
+    // Draw Premium Zone
+    string prem_name = obj_prefix + "PremiumZone_" + (string)range_start_time;
+    ObjectCreate(0, prem_name, OBJ_RECTANGLE, 0, range_start_time, highest_high, end_time, equilibrium);
+    ObjectSetInteger(0, prem_name, OBJPROP_COLOR, InpPremiumColor);
+    ObjectSetInteger(0, prem_name, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, prem_name, OBJPROP_BACK, true);
+    ObjectSetInteger(0, prem_name, OBJPROP_FILL, true);
+
+    // Draw Discount Zone
+    string disc_name = obj_prefix + "DiscountZone_" + (string)range_start_time;
+    ObjectCreate(0, disc_name, OBJ_RECTANGLE, 0, range_start_time, equilibrium, end_time, lowest_low);
+    ObjectSetInteger(0, disc_name, OBJPROP_COLOR, InpDiscountColor);
+    ObjectSetInteger(0, disc_name, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, disc_name, OBJPROP_BACK, true);
+    ObjectSetInteger(0, disc_name, OBJPROP_FILL, true);
+
+    string disc_label_name = obj_prefix + "DiscountLabel_" + (string)range_start_time;
+    if(ObjectCreate(0, disc_label_name, OBJ_TEXT, 0, range_start_time, (equilibrium + lowest_low) / 2.0 ))
+    {
+        ObjectSetString(0, disc_label_name, OBJPROP_TEXT, "Discount");
+        ObjectSetInteger(0, disc_label_name, OBJPROP_COLOR, InpDiscountColor);
+        ObjectSetInteger(0, disc_label_name, OBJPROP_ANCHOR, ANCHOR_LEFT);
+        ObjectSetInteger(0, disc_label_name, OBJPROP_FONTSIZE, DEFAULT_FONT_SIZE);
+    }
+
+    // Draw Equilibrium Line
+    string eq_name = obj_prefix + "EquilibriumLine_" + (string)range_start_time;
+    ObjectCreate(0, eq_name, OBJ_HLINE, 0, 0, equilibrium);
+    ObjectSetInteger(0, eq_name, OBJPROP_COLOR, InpEquilibriumColor);
+    ObjectSetInteger(0, eq_name, OBJPROP_STYLE, STYLE_DOT);
+    ObjectSetInteger(0, eq_name, OBJPROP_WIDTH, 1);
+    ObjectSetString(0, eq_name, OBJPROP_TEXT, "EQ");
+}
+
+//+------------------------------------------------------------------+
+//| Draw Multi-Timeframe High/Low levels                             |
+//+------------------------------------------------------------------+
+void DrawLevelHelper(double price, color clr, string text, string obj_prefix)
+{
+    string name = obj_prefix + text;
+    ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+    ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+}
+
+void DrawMTFLevels()
+{
+    string prefix = G_OBJECT_PREFIX + "MTF_";
+
+    // Previous Day High/Low
+    if(InpShowDailyLevels)
+    {
+        DrawLevelHelper(iHigh(_Symbol, PERIOD_D1, 1), InpDailyLevelColor, "PDH", prefix);
+        DrawLevelHelper(iLow(_Symbol, PERIOD_D1, 1), InpDailyLevelColor, "PDL", prefix);
+    }
+
+    // Previous Week High/Low
+    if(InpShowWeeklyLevels)
+    {
+        DrawLevelHelper(iHigh(_Symbol, PERIOD_W1, 1), InpWeeklyLevelColor, "PWH", prefix);
+        DrawLevelHelper(iLow(_Symbol, PERIOD_W1, 1), InpWeeklyLevelColor, "PWL", prefix);
+    }
+
+    // Previous Month High/Low
+    if(InpShowMonthlyLevels)
+    {
+        DrawLevelHelper(iHigh(_Symbol, PERIOD_MN1, 1), InpMonthlyLevelColor, "PMH", prefix);
+        DrawLevelHelper(iLow(_Symbol, PERIOD_MN1, 1), InpMonthlyLevelColor, "PML", prefix);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+//--- indicator buffers mapping
+   SetIndexBuffer(0, ExtDummyBuffer, INDICATOR_DATA);
+   PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
+
+   SetIndexBuffer(1, OpenBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, HighBuffer, INDICATOR_DATA);
+   SetIndexBuffer(3, LowBuffer, INDICATOR_DATA);
+   SetIndexBuffer(4, CloseBuffer, INDICATOR_DATA);
+   SetIndexBuffer(5, ColorBuffer, INDICATOR_COLOR_INDEX);
+   
+   PlotIndexSetInteger(1, PLOT_DRAW_TYPE, DRAW_COLOR_CANDLES);
+   PlotIndexSetString(1, PLOT_LABEL, "Trend");
+
+//--- Set the indicator name
+   IndicatorSetString(INDICATOR_SHORTNAME, "SMC Structure");
+
+//--- Generate a unique prefix for all objects of this indicator instance
+   MathSrand((int)TimeCurrent());
+   G_OBJECT_PREFIX = "SMC_" + (string)ChartID() + "_" + (string)MathRand() + "_";
+
+//--- Get ATR Handle ---
+   ExtAtrHandle = iATR(_Symbol, _Period, ATR_PERIOD);
+   if(ExtAtrHandle == INVALID_HANDLE)
+     {
+      Print("Error creating ATR indicator handle - Error: ", GetLastError());
+      return(INIT_FAILED);
+     }
+     
+   G_DefaultBgColor = (color)ChartGetInteger(0, CHART_COLOR_BACKGROUND, 0);
+
+//--- Initialization finished
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Main Analysis Orchestration Functions                            |
+//+------------------------------------------------------------------+
+void UpdateTrendByBar(const int rates_total, const Structure &structures[], ENUM_TREND &trend_by_bar[])
+{
+    ArrayResize(trend_by_bar, rates_total);
+    ArrayInitialize(trend_by_bar, TREND_NONE);
+    int last_structure_bar = 0;
+
+    for(int i = 0; i < ArraySize(structures); i++)
+    {
+        const Structure s = structures[i];
+        
+        for(int k = last_structure_bar; k < s.bar_index; k++)
+        {
+            if (k < rates_total) trend_by_bar[k] = s.trend == TREND_UP ? TREND_DOWN : TREND_UP; // Trend before the break
+        }
+        
+        for(int k = s.bar_index; k < rates_total; k++)
+        {
+            if (i + 1 < ArraySize(structures) && k >= structures[i+1].bar_index) break;
+            trend_by_bar[k] = s.trend; // Trend after the break
+        }
+        last_structure_bar = s.bar_index;
+    }
+}
+
+void AnalyzeAllStructures(const MqlRates &rates[], const int rates_total)
+{
+    // Clear previous analysis data
+    ArrayFree(ExtMajorSwingPoints);
+    ArrayFree(ExtPrimarySwingPoints);
+    ArrayFree(ExtSubSwingPoints);
+    ArrayFree(ExtMajorStructures);
+    ArrayFree(ExtPrimaryStructures);
+    ArrayFree(ExtSubStructures);
+    ArrayResize(ExtSwingTrendByBar, rates_total);
+    ArrayResize(ExtInternalTrendByBar, rates_total);
+
+    // --- Major Structure ---
+    if(InpShowMajorStructure) {
+        FindSwingPoints(rates, rates_total, InpMajorLookback, ExtMajorSwingPoints);
+        FindStructure(rates, rates_total, ExtMajorSwingPoints, ExtMajorStructures, ExtSwingOrderBlocks);
+        UpdateTrendByBar(rates_total, ExtMajorStructures, ExtSwingTrendByBar);
+        DrawSwingStructure(ExtMajorSwingPoints, ExtMajorStructures, InpMajorLineColor, InpMajorLineWidth, InpMajorLineStyle, G_OBJECT_PREFIX + "Major_");
+    }
+    // --- Primary/Swing Structure ---
+    if(InpShowSwingStructure) {
+        FindSwingPoints(rates, rates_total, InpSwingLookback, ExtPrimarySwingPoints);
+        FindStructure(rates, rates_total, ExtPrimarySwingPoints, ExtPrimaryStructures, ExtSwingOrderBlocks);
+        DrawSwingStructure(ExtPrimarySwingPoints, ExtPrimaryStructures, InpSwingLineColor, InpSwingLineWidth, InpSwingLineStyle, G_OBJECT_PREFIX + "Primary_");
+    }
+    // --- Internal/Sub Structure ---
+    if(InpShowInternalStructure) {
+        FindSwingPoints(rates, rates_total, InpInternalLookback, ExtSubSwingPoints);
+        FindStructure(rates, rates_total, ExtSubSwingPoints, ExtSubStructures, ExtInternalOrderBlocks);
+        UpdateTrendByBar(rates_total, ExtSubStructures, ExtInternalTrendByBar);
+        DrawSwingStructure(ExtSubSwingPoints, ExtSubStructures, InpInternalLineColor, InpInternalLineWidth, InpInternalLineStyle, G_OBJECT_PREFIX + "Internal_");
+    }
+}
+
+void AnalyzeAndDrawPOIs(const MqlRates &rates[], const int rates_total)
+{
+    // Clear previous POI data
+    ArrayFree(ExtSwingOrderBlocks);
+    ArrayFree(ExtInternalOrderBlocks);
+    ArrayFree(ExtFairValueGaps);
+
+    // Find, Update, and Draw Order Blocks
+    if(InpShowSwingOB)
+    {
+        DrawOrderBlocks(ExtSwingOrderBlocks, InpMaxSwingOB, InpSwingBullishOBColor, InpSwingBearishOBColor, InpSwingOBBorderWidth, "SwingOB_");
+    }
+    if(InpShowInternalOB)
+    {
+        DrawOrderBlocks(ExtInternalOrderBlocks, InpMaxInternalOB, InpIntBullishOBColor, InpIntBearishOBColor, InpInternalOBBorderWidth, "InternalOB_");
+    }
+
+    // Find, Update, and Draw Fair Value Gaps
+    if(InpShowFVG)
+    {
+        FindFairValueGaps(rates, rates_total, ExtFairValueGaps);
+        UpdateFVGMitigation(rates, ExtFairValueGaps);
+        DrawFairValueGaps(ExtFairValueGaps);
+    }
+    
+    // Find and Draw Equal Highs/Lows (based on primary structure)
+    if(InpShowEQLH) {
+        DrawEqualHighsLows(ExtPrimarySwingPoints, G_OBJECT_PREFIX + "EQLH_");
+    }
+
+    // Draw Strong/Weak Highs/Lows
+    if(InpShowStrongWeakHighLow) {
+        DrawStrongWeakHighLows();
+    }
+}
+
+void DrawStrongWeakHighLows()
+{
+    if (ArraySize(ExtPrimaryStructures) == 0) return;
+
+    const Structure last_leg = ExtPrimaryStructures[ArraySize(ExtPrimaryStructures) - 1];
+
+    // Draw Strong/Weak High Label
+    string high_label_text = (last_leg.trend == TREND_DOWN) ? "Strong High" : "Weak High";
+    color high_color = (last_leg.trend == TREND_DOWN) ? InpSwingBearishOBColor : clrGray;
+    string high_label_name = G_OBJECT_PREFIX + "SWH_High_" + (string)last_leg.high_time;
+    
+    if(ObjectCreate(0, high_label_name, OBJ_TEXT, 0, last_leg.high_time, last_leg.high_price))
+    {
+        ObjectSetString(0, high_label_name, OBJPROP_TEXT, high_label_text);
+        ObjectSetInteger(0, high_label_name, OBJPROP_COLOR, high_color);
+        ObjectSetInteger(0, high_label_name, OBJPROP_FONTSIZE, DEFAULT_FONT_SIZE - 2);
+        ObjectSetInteger(0, high_label_name, OBJPROP_ANCHOR, ANCHOR_BOTTOM);
+    }
+
+    // Draw Strong/Weak Low Label
+    string low_label_text = (last_leg.trend == TREND_UP) ? "Strong Low" : "Weak Low";
+    color low_color = (last_leg.trend == TREND_UP) ? InpSwingBullishOBColor : clrGray;
+    string low_label_name = G_OBJECT_PREFIX + "SWH_Low_" + (string)last_leg.low_time;
+
+    if(ObjectCreate(0, low_label_name, OBJ_TEXT, 0, last_leg.low_time, last_leg.low_price))
+    {
+        ObjectSetString(0, low_label_name, OBJPROP_TEXT, low_label_text);
+        ObjectSetInteger(0, low_label_name, OBJPROP_COLOR, low_color);
+        ObjectSetInteger(0, low_label_name, OBJPROP_FONTSIZE, DEFAULT_FONT_SIZE - 2);
+        ObjectSetInteger(0, low_label_name, OBJPROP_ANCHOR, ANCHOR_TOP);
+    }
+}
+
+void DrawAllPDZones()
+{
+    // Draw P/D zones for the most recent leg of each visible structure
+    if(InpShowPDZones) {
+        if(InpShowMajorStructure && ArraySize(ExtMajorStructures) > 0) 
+            DrawPremiumDiscountZone(ExtMajorStructures[ArraySize(ExtMajorStructures)-1], G_OBJECT_PREFIX + "Major_");
+        if(InpShowSwingStructure && ArraySize(ExtPrimaryStructures) > 0) 
+            DrawPremiumDiscountZone(ExtPrimaryStructures[ArraySize(ExtPrimaryStructures)-1], G_OBJECT_PREFIX + "Primary_");
+        if(InpShowInternalStructure && ArraySize(ExtSubStructures) > 0) 
+            DrawPremiumDiscountZone(ExtSubStructures[ArraySize(ExtSubStructures)-1], G_OBJECT_PREFIX + "Internal_");
+    }
+}
+
+void HandleTrendColoring(const int rates_total, const double &open[], const double &high[], const double &low[], const double &close[])
+{
+    // Set candle colors
+    if(InpInternalTrendType == TREND_COLOR_CANDLES || InpSwingTrendType == TREND_COLOR_CANDLES)
+    {
+        for(int i = 0; i < rates_total; i++)
+        {
+            OpenBuffer[i] = open[i];
+            HighBuffer[i] = high[i];
+            LowBuffer[i] = low[i];
+            CloseBuffer[i] = close[i];
+
+            if(InpInternalTrendType == TREND_COLOR_CANDLES && ExtInternalTrendByBar[i] != TREND_NONE)
+            {
+                ColorBuffer[i] = (ExtInternalTrendByBar[i] == TREND_UP) ? 0 : 1;
+            }
+            else if(InpSwingTrendType == TREND_COLOR_CANDLES && ExtSwingTrendByBar[i] != TREND_NONE)
+            {
+                ColorBuffer[i] = (ExtSwingTrendByBar[i] == TREND_UP) ? 2 : 3;
+            }
+            else
+            {
+                ColorBuffer[i] = -1; // No color
+            }
+        }
+    }
+
+    // Set background color
+    bool background_set = false;
+    if(rates_total > 0)
+    {
+        if(InpInternalTrendType == TREND_COLOR_BACKGROUND)
+        {
+            ENUM_TREND trend = ExtInternalTrendByBar[rates_total - 1];
+            if(trend != TREND_NONE)
+            {
+                ChartSetInteger(0, CHART_COLOR_BACKGROUND, trend == TREND_UP ? InpInternalBullTrendColor : InpInternalBearTrendColor);
+                background_set = true;
+            }
+        }
+        else if(InpSwingTrendType == TREND_COLOR_BACKGROUND) // Use else if to give priority to internal
+        {
+            ENUM_TREND trend = ExtSwingTrendByBar[rates_total - 1];
+            if(trend != TREND_NONE)
+            {
+                ChartSetInteger(0, CHART_COLOR_BACKGROUND, trend == TREND_UP ? InpSwingBullTrendColor : InpSwingBearTrendColor);
+                background_set = true;
+            }
+        }
+    }
+
+    if(!background_set)
+    {
+        ChartSetInteger(0, CHART_COLOR_BACKGROUND, G_DefaultBgColor);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization function                                        |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+//--- Remove all our objects
+   CleanupObjects(G_OBJECT_PREFIX);
+   ChartSetInteger(0, CHART_COLOR_BACKGROUND, G_DefaultBgColor);
+
+//--- Release ATR Handle
+   if(ExtAtrHandle != INVALID_HANDLE)
+      IndicatorRelease(ExtAtrHandle);
+  }
+//+------------------------------------------------------------------+
